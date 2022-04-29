@@ -1,0 +1,195 @@
+```{r setup, include = F}
+knitr::opts_chunk$set(message = F, warning = F)
+```
+
+```{r}
+devtools::install_github("mayer79/MetricsWeighted")
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(gridExtra)
+library(lubridate)
+library(imputeTS)
+library(tictoc)
+library(forecast)
+```
+
+```{r}
+train_df <- read.csv(file='./data/train.csv', header=TRUE)
+glimpse(train_df)
+
+test_df  <- read.csv(file='./data/test.csv', header=TRUE)
+glimpse(test_df)
+
+stores  <- read.csv(file='./data/stores.csv', header=TRUE)
+glimpse(stores)
+
+features <- read.csv(file='./data/features.csv', header=TRUE)
+glimpse(features)
+```
+
+### Data Preprocessing
+
+We attempt time-series forecasting based on only the `Weekly_Sales` of each unique pair of `Store` and `Dept`. We will use only `train_df` and `test_df` datasets.
+
+##### Check for NA values
+
+```{r}
+checkForNA <- function(data){
+  apply(is.na(data), 2, function(col) paste0(round(mean(col) * 100, 2), "%"))
+}
+```
+
+```{r}
+checkForNA(train_df)
+checkForNA(test_df)
+```
+
+There are no NA values in any columns.
+
+##### Combine `Store` and `Dept` to form unique identifier for each department across all stores
+
+```{r}
+addUniqueStoreDept <- function(data){
+  mutate(data, storeDept = paste0(Store, "_", Dept),
+         .before = 1)
+}
+```
+
+```{r}
+train_df <- addUniqueStoreDept((train_df))
+test_df <- addUniqueStoreDept((test_df))
+
+head(train_df)
+```
+
+##### Check if every `storeDept` in `test_df` have historical observations in `train_df`
+
+```{r}
+n_distinct(train_df$storeDept)
+n_distinct(test_df$storeDept)
+```
+
+```{r}
+train_df <- filter(train_df, storeDept %in% unique(test_df$storeDept))
+
+n_distinct(test_df$storeDept) - n_distinct(train_df$storeDept)
+```
+
+```{r}
+(storeDeptNoData <- 
+  test_df %>%
+  filter(!storeDept %in% unique(train_df$storeDept)) %>%
+  .$storeDept %>%
+  unique())
+```
+
+```{r}
+# Add 1 because the first week is not accounted for in the difference
+
+startTrain <- min(train_df$Date)
+endTrain <- max(train_df$Date)
+
+startTest <- min(test_df$Date)
+endTest <- max(test_df$Date)
+
+(lengthTrain <- difftime(endTrain, startTrain, units = "weeks") + 1)
+(lengthTest <- difftime(endTest, startTest, units = "weeks") + 1)
+```
+
+
+```{r}
+obsPerStoreDept <-
+  train_df %>%
+  count(storeDept) %>%
+  arrange(n) %>%
+  rename(numObs = n)
+
+unique(obsPerStoreDept$numObs)
+```
+
+
+```{r fig.height = 3, fig.width = 8}
+obsPerStoreDept %>%
+  count(numObs) %>%
+  ggplot(aes(numObs, n)) +
+  ylab("Frequency") + xlab("Number of Observations") +
+  geom_jitter(color = "orangered", alpha = 0.5, height = 100) +  
+  geom_vline(xintercept = 143, lty = 2, lwd = 0.5, color = "steelblue")
+```
+
+
+
+```{r}
+numObs_vs_weeklySales <- train_df %>%
+  merge(obsPerStoreDept, by = "storeDept") %>%
+  select(Date, storeDept, Weekly_Sales, numObs)
+```
+
+```{r}
+numObsLabels <- c("FALSE" = "numObs == 143", "TRUE" = "numObs < 143")
+
+numObs_vs_weeklySales.aes <- function(data, scales = "free_y"){
+  data %>%
+  ggplot(aes(fill = as.factor(numObs == 143) ,
+             color = as.factor(numObs == 143))) +
+  theme(legend.position = "none") +
+  facet_grid(rows = vars(numObs < 143),
+             labeller = as_labeller(numObsLabels),
+             scales = scales)
+}
+```
+
+```{r fig.width = 8}
+numObs_vs_weeklySales.aes(numObs_vs_weeklySales) +
+  geom_density(aes(Weekly_Sales), alpha = 0.5) +
+  coord_cartesian(xlim = c(-5000,100000))
+```
+
+It seems that both distributions are right-skewed. `storeDept` with missing number of observations clearly have a smaller spread of `Weekly_Sales` around the peak.
+
+We plot the time series for median of `Weekly_Sales` across `storeDept` and indicate the holiday weeks and the previous week of the holidays to get a general idea.
+
+```{r}
+(holidayWeeks <-
+  train_df %>%
+  filter(IsHoliday == T) %>%
+  .$Date %>%
+  unique())
+
+#(weekBeforeHolidays <- holidayWeeks - 7)
+```
+
+```{r fig.width = 8}
+numObs_vs_weeklySales.aes(numObs_vs_weeklySales) +
+  stat_summary(aes(Date, Weekly_Sales), fun = median, geom = "line", lwd = 1.3) +
+  geom_vline(xintercept = holidayWeeks, lty = 2, lwd = 0.1, alpha = 0.3) +
+  geom_vline(xintercept = weekBeforeHolidays, lty = 2, lwd = 0.1, alpha = 0.3)
+```
+
+Promotions usually start before the holidays to attract early holiday shoppers. Hence, we expect `Weekly_Sales` to be rising before the holidays. This is apparent in the periods before Super Bowl, Thanksgiving and Christmas. However, such an effect is not that noticeable before Labor Day.
+
+Both plots show similar behavior as described above, although the magnitude of `Weekly_Sales` for `storeDept` with irregular time series is significantly smaller. We go on to confirm their differences in magnitude.
+
+```{r}
+numObs_vs_weeklySales.scatter <- function(fn, title){
+  numObs_vs_weeklySales %>%
+  group_by(storeDept, numObs) %>%
+  summarize(Weekly_Sales = fn(Weekly_Sales)) %>%
+  numObs_vs_weeklySales.aes(scales = "fixed") +
+  geom_jitter(aes(numObs, Weekly_Sales), width = 3, height = 5000, alpha = 0.3) +
+  ggtitle(title)
+}
+```
+
+```{r warning = F, fig.height = 6}
+grid.arrange(numObs_vs_weeklySales.scatter(median, "Median"),
+             numObs_vs_weeklySales.scatter(mean, "Mean"),
+             numObs_vs_weeklySales.scatter(min, "Min"),
+             numObs_vs_weeklySales.scatter(max, "Max"),
+             numObs_vs_weeklySales.scatter(sd, "Standard Deviation"),
+             ncol = 3, nrow = 2)
+```
+
+
